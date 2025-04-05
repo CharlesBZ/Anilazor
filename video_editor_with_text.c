@@ -5,19 +5,27 @@
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavutil/opt.h>
+#include <libswscale/swscale.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <stdio.h>
 #include <string.h>
 
-#define WINDOW_WIDTH 600
-#define WINDOW_HEIGHT 400
+#define WINDOW_WIDTH 800
+#define WINDOW_HEIGHT 600
+#define PREVIEW_WIDTH 320
+#define PREVIEW_HEIGHT 240
 
-// Function prototype
-int process_video(const char *input_file, const char *output_file, double trim_duration, 
-                  const char *text, const char *filter_preset, int width, int height);
+typedef struct {
+    char input_file[256];
+    char output_file[256];
+    char trim_str[32];
+    char text[256];
+    char filter_str[32];
+    char res_str[32];
+    int active_field; // 0-5 for each field
+} EditorState;
 
-// Process video function (unchanged from previous version)
 int process_video(const char *input_file, const char *output_file, double trim_duration, 
                   const char *text, const char *filter_preset, int width, int height) {
     AVFormatContext *input_fmt_ctx = NULL, *output_fmt_ctx = NULL;
@@ -157,56 +165,106 @@ end:
     return ret < 0 ? -1 : 0;
 }
 
+void render_text(SDL_Renderer *renderer, TTF_Font *font, const char *text, int x, int y, SDL_Color color) {
+    SDL_Surface *surface = TTF_RenderText_Solid(font, text, color);
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+    SDL_Rect rect = {x, y, surface->w, surface->h};
+    SDL_RenderCopy(renderer, texture, NULL, &rect);
+    SDL_FreeSurface(surface);
+    SDL_DestroyTexture(texture);
+}
+
 int main(int argc, char *argv[]) {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-        return 1;
-    }
-    if (TTF_Init() < 0) {
-        fprintf(stderr, "TTF_Init failed: %s\n", TTF_GetError());
-        SDL_Quit();
+    if (SDL_Init(SDL_INIT_VIDEO) < 0 || TTF_Init() < 0) {
+        fprintf(stderr, "Init failed: %s\n", SDL_GetError());
         return 1;
     }
 
     SDL_Window *window = SDL_CreateWindow("Video Editor", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                           WINDOW_WIDTH, WINDOW_HEIGHT, 0);
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    TTF_Font *font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16); // Adjust font path
+    TTF_Font *font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16);
     if (!window || !renderer || !font) {
-        fprintf(stderr, "SDL/TTF setup failed: %s\n", SDL_GetError());
+        fprintf(stderr, "Setup failed: %s\n", SDL_GetError());
         TTF_Quit();
         SDL_Quit();
         return 1;
     }
 
-    char input_file[256] = "input.mp4";
-    char output_file[256] = "output.mp4";
-    char text[256] = "Hello World";
-    char trim_str[32] = "10.0";
-    char filter_str[32] = "None";
-    char res_str[32] = "1080p";
-    int filter_choice = 1, res_choice = 1;
-    int processing = 0;
+    EditorState state = {
+        .input_file = "input.mp4",
+        .output_file = "output.mp4",
+        .trim_str = "10.0",
+        .text = "Hello World",
+        .filter_str = "None",
+        .res_str = "1080p",
+        .active_field = -1
+    };
+
+    // Preview setup
+    AVFormatContext *preview_ctx = NULL;
+    AVCodecContext *preview_dec_ctx = NULL;
+    struct SwsContext *sws_ctx = NULL;
+    SDL_Texture *preview_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YUY2, SDL_TEXTUREACCESS_STREAMING, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    int video_stream_index = -1;
+    AVPacket packet;
+    AVFrame *frame = av_frame_alloc();
+
+    if (avformat_open_input(&preview_ctx, state.input_file, NULL, NULL) >= 0 &&
+        avformat_find_stream_info(preview_ctx, NULL) >= 0) {
+        video_stream_index = av_find_best_stream(preview_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+        if (video_stream_index >= 0) {
+            AVStream *stream = preview_ctx->streams[video_stream_index];
+            const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+            preview_dec_ctx = avcodec_alloc_context3(decoder);
+            avcodec_parameters_to_context(preview_dec_ctx, stream->codecpar);
+            avcodec_open2(preview_dec_ctx, decoder, NULL);
+            sws_ctx = sws_getContext(preview_dec_ctx->width, preview_dec_ctx->height, preview_dec_ctx->pix_fmt,
+                                     PREVIEW_WIDTH, PREVIEW_HEIGHT, AV_PIX_FMT_YUY2, SWS_BILINEAR, NULL, NULL, NULL);
+        }
+    }
 
     SDL_Event event;
-    int quit = 0;
+    int quit = 0, processing = 0;
     while (!quit) {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) quit = 1;
-            if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_RETURN && !processing) {
-                double trim_duration = atof(trim_str);
-                const char *filter_preset = (filter_choice == 1) ? "null" : 
-                                            (filter_choice == 2) ? "eq=brightness=0.1" : 
-                                            "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131";
-                int width = (res_choice == 1) ? 1920 : 1280;
-                int height = (res_choice == 1) ? 1080 : 720;
-                processing = 1;
-                if (process_video(input_file, output_file, trim_duration, text, filter_preset, width, height) == 0) {
-                    strcpy(res_str, "Done!");
-                } else {
-                    strcpy(res_str, "Error");
+            if (event.type == SDL_MOUSEBUTTONDOWN) {
+                int x = event.button.x, y = event.button.y;
+                if (y >= 10 && y < 30) state.active_field = 0; // Input file
+                else if (y >= 40 && y < 60) state.active_field = 1; // Output file
+                else if (y >= 70 && y < 90) state.active_field = 2; // Trim duration
+                else if (y >= 100 && y < 120) state.active_field = 3; // Text
+                else if (y >= 130 && y < 150) state.active_field = 4; // Filter
+                else if (y >= 160 && y < 180) state.active_field = 5; // Resolution
+                else if (x >= 500 && x < 580 && y >= 500 && y < 540) { // Process button
+                    if (!processing) {
+                        double trim_duration = atof(state.trim_str);
+                        const char *filter_preset = strcmp(state.filter_str, "Brighten") == 0 ? "eq=brightness=0.1" :
+                                                    strcmp(state.filter_str, "Sepia") == 0 ? "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131" : "null";
+                        int width = strcmp(state.res_str, "1080p") == 0 ? 1920 : 1280;
+                        int height = strcmp(state.res_str, "1080p") == 0 ? 1080 : 720;
+                        processing = 1;
+                        process_video(state.input_file, state.output_file, trim_duration, state.text, filter_preset, width, height);
+                        processing = 0;
+                    }
                 }
-                processing = 0;
+            }
+            if (event.type == SDL_TEXTINPUT && state.active_field >= 0) {
+                char *target = state.active_field == 0 ? state.input_file :
+                               state.active_field == 1 ? state.output_file :
+                               state.active_field == 2 ? state.trim_str :
+                               state.active_field == 3 ? state.text :
+                               state.active_field == 4 ? state.filter_str : state.res_str;
+                strncat(target, event.text.text, sizeof(state.input_file) - strlen(target) - 1);
+            }
+            if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_BACKSPACE && state.active_field >= 0) {
+                char *target = state.active_field == 0 ? state.input_file :
+                               state.active_field == 1 ? state.output_file :
+                               state.active_field == 2 ? state.trim_str :
+                               state.active_field == 3 ? state.text :
+                               state.active_field == 4 ? state.filter_str : state.res_str;
+                target[strlen(target) - 1] = '\0';
             }
         }
 
@@ -214,30 +272,48 @@ int main(int argc, char *argv[]) {
         SDL_RenderClear(renderer);
 
         SDL_Color color = {0, 0, 0, 255};
-        char display_text[512];
-        snprintf(display_text, sizeof(display_text), "Input File: %s", input_file);
-        SDL_Surface *surface = TTF_RenderText_Solid(font, display_text, color);
-        SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
-        SDL_Rect rect = {10, 10, surface->w, surface->h};
-        SDL_RenderCopy(renderer, texture, NULL, &rect);
-        SDL_FreeSurface(surface);
-        SDL_DestroyTexture(texture);
+        render_text(renderer, font, "Input File: ", 10, 10, color);
+        render_text(renderer, font, state.input_file, 100, 10, color);
+        render_text(renderer, font, "Output File: ", 10, 40, color);
+        render_text(renderer, font, state.output_file, 100, 40, color);
+        render_text(renderer, font, "Trim Duration: ", 10, 70, color);
+        render_text(renderer, font, state.trim_str, 100, 70, color);
+        render_text(renderer, font, "Text: ", 10, 100, color);
+        render_text(renderer, font, state.text, 100, 100, color);
+        render_text(renderer, font, "Filter: ", 10, 130, color);
+        render_text(renderer, font, state.filter_str, 100, 130, color);
+        render_text(renderer, font, "Resolution: ", 10, 160, color);
+        render_text(renderer, font, state.res_str, 100, 160, color);
 
-        snprintf(display_text, sizeof(display_text), "Output File: %s", output_file);
-        surface = TTF_RenderText_Solid(font, display_text, color);
-        texture = SDL_CreateTextureFromSurface(renderer, surface);
-        rect.y = 40;
-        rect.w = surface->w;
-        rect.h = surface->h;
-        SDL_RenderCopy(renderer, texture, NULL, &rect);
-        SDL_FreeSurface(surface);
-        SDL_DestroyTexture(texture);
+        SDL_Rect button = {500, 500, 80, 40};
+        SDL_SetRenderDrawColor(renderer, 0, 128, 0, 255);
+        SDL_RenderFillRect(renderer, &button);
+        render_text(renderer, font, "Process", 510, 510, color);
 
-        // Add more fields as needed...
+        // Preview rendering
+        if (preview_dec_ctx && av_read_frame(preview_ctx, &packet) >= 0) {
+            if (packet.stream_index == video_stream_index) {
+                avcodec_send_packet(preview_dec_ctx, &packet);
+                if (avcodec_receive_frame(preview_dec_ctx, frame) >= 0) {
+                    uint8_t *data[4];
+                    int linesize[4];
+                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, preview_dec_ctx->height, data, linesize);
+                    SDL_UpdateTexture(preview_texture, NULL, data[0], linesize[0]);
+                    SDL_Rect preview_rect = {WINDOW_WIDTH - PREVIEW_WIDTH - 10, 10, PREVIEW_WIDTH, PREVIEW_HEIGHT};
+                    SDL_RenderCopy(renderer, preview_texture, NULL, &preview_rect);
+                }
+            }
+            av_packet_unref(&packet);
+        }
 
         SDL_RenderPresent(renderer);
     }
 
+    if (preview_ctx) avformat_close_input(&preview_ctx);
+    if (preview_dec_ctx) avcodec_free_context(&preview_dec_ctx);
+    if (sws_ctx) sws_freeContext(sws_ctx);
+    if (frame) av_frame_free(&frame);
+    SDL_DestroyTexture(preview_texture);
     TTF_CloseFont(font);
     TTF_Quit();
     SDL_DestroyRenderer(renderer);
