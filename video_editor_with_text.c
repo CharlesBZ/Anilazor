@@ -6,13 +6,18 @@
 #include <libavfilter/buffersrc.h>
 #include <libavutil/opt.h>
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
 #include <stdio.h>
 #include <string.h>
 
 #define WINDOW_WIDTH 600
 #define WINDOW_HEIGHT 400
 
-// Function to process the video (same as before, refactored)
+// Function prototype
+int process_video(const char *input_file, const char *output_file, double trim_duration, 
+                  const char *text, const char *filter_preset, int width, int height);
+
+// Process video function (unchanged from previous version)
 int process_video(const char *input_file, const char *output_file, double trim_duration, 
                   const char *text, const char *filter_preset, int width, int height) {
     AVFormatContext *input_fmt_ctx = NULL, *output_fmt_ctx = NULL;
@@ -157,17 +162,23 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
-
-    SDL_Window *window = SDL_CreateWindow("Video Editor", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                          WINDOW_WIDTH, WINDOW_HEIGHT, 0);
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    if (!window || !renderer) {
-        fprintf(stderr, "SDL_CreateWindow/Renderer failed: %s\n", SDL_GetError());
+    if (TTF_Init() < 0) {
+        fprintf(stderr, "TTF_Init failed: %s\n", TTF_GetError());
         SDL_Quit();
         return 1;
     }
 
-    // Simple text input fields (simulated with variables)
+    SDL_Window *window = SDL_CreateWindow("Video Editor", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                          WINDOW_WIDTH, WINDOW_HEIGHT, 0);
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    TTF_Font *font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16); // Adjust font path
+    if (!window || !renderer || !font) {
+        fprintf(stderr, "SDL/TTF setup failed: %s\n", SDL_GetError());
+        TTF_Quit();
+        SDL_Quit();
+        return 1;
+    }
+
     char input_file[256] = "input.mp4";
     char output_file[256] = "output.mp4";
     char text[256] = "Hello World";
@@ -182,47 +193,53 @@ int main(int argc, char *argv[]) {
     while (!quit) {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) quit = 1;
-            if (event.type == SDL_TEXTINPUT || event.type == SDL_KEYDOWN) {
-                if (event.key.keysym.sym == SDLK_RETURN) {
-                    if (!processing) {
-                        double trim_duration = atof(trim_str);
-                        const char *filter_preset = (filter_choice == 1) ? "null" : 
-                                                    (filter_choice == 2) ? "eq=brightness=0.1" : 
-                                                    "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131";
-                        int width = (res_choice == 1) ? 1920 : 1280;
-                        int height = (res_choice == 1) ? 1080 : 720;
-                        processing = 1;
-                        if (process_video(input_file, output_file, trim_duration, text, filter_preset, width, height) == 0) {
-                            strcpy(res_str, "Done!");
-                        } else {
-                            strcpy(res_str, "Error");
-                        }
-                        processing = 0;
-                    }
-                } else if (event.type == SDL_TEXTINPUT) {
-                    if (SDL_GetKeyboardFocus() == window) {
-                        strncat(input_file, event.text.text, sizeof(input_file) - strlen(input_file) - 1);
-                    }
+            if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_RETURN && !processing) {
+                double trim_duration = atof(trim_str);
+                const char *filter_preset = (filter_choice == 1) ? "null" : 
+                                            (filter_choice == 2) ? "eq=brightness=0.1" : 
+                                            "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131";
+                int width = (res_choice == 1) ? 1920 : 1280;
+                int height = (res_choice == 1) ? 1080 : 720;
+                processing = 1;
+                if (process_video(input_file, output_file, trim_duration, text, filter_preset, width, height) == 0) {
+                    strcpy(res_str, "Done!");
+                } else {
+                    strcpy(res_str, "Error");
                 }
+                processing = 0;
             }
         }
 
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         SDL_RenderClear(renderer);
 
-        // Very basic rendering (no SDL_ttf for simplicity)
-        SDL_Rect rect = {10, 10, WINDOW_WIDTH - 20, 20};
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderDrawRect(renderer, &rect);
-        rect.y += 40; SDL_RenderDrawRect(renderer, &rect);
-        rect.y += 40; SDL_RenderDrawRect(renderer, &rect);
-        rect.y += 40; SDL_RenderDrawRect(renderer, &rect);
-        rect.y += 40; SDL_RenderDrawRect(renderer, &rect);
-        rect.y += 40; SDL_RenderDrawRect(renderer, &rect);
+        SDL_Color color = {0, 0, 0, 255};
+        char display_text[512];
+        snprintf(display_text, sizeof(display_text), "Input File: %s", input_file);
+        SDL_Surface *surface = TTF_RenderText_Solid(font, display_text, color);
+        SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+        SDL_Rect rect = {10, 10, surface->w, surface->h};
+        SDL_RenderCopy(renderer, texture, NULL, &rect);
+        SDL_FreeSurface(surface);
+        SDL_DestroyTexture(texture);
+
+        snprintf(display_text, sizeof(display_text), "Output File: %s", output_file);
+        surface = TTF_RenderText_Solid(font, display_text, color);
+        texture = SDL_CreateTextureFromSurface(renderer, surface);
+        rect.y = 40;
+        rect.w = surface->w;
+        rect.h = surface->h;
+        SDL_RenderCopy(renderer, texture, NULL, &rect);
+        SDL_FreeSurface(surface);
+        SDL_DestroyTexture(texture);
+
+        // Add more fields as needed...
 
         SDL_RenderPresent(renderer);
     }
 
+    TTF_CloseFont(font);
+    TTF_Quit();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
